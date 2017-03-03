@@ -8,6 +8,7 @@
 #include <linux/cred.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
+#include <linux/semaphore.h>
 #include <asm/uaccess.h>
 
 #define DEVICE_NAME "my_pipe"
@@ -15,12 +16,14 @@
 /* связанный список указателей на буферы
  * для каждого пользователя
  */
-
+static DECLARE_WAIT_QUEUE_HEAD(wq);
+static DECLARE_WAIT_QUEUE_HEAD(rq);
 struct task_struct;
+struct semaphore sem;
 
 struct user_buf {
 	kuid_t user_id;
-	unsigned char *buf;
+	char *buf;
 	unsigned long w_index;
 	unsigned long r_index;
 	struct list_head list;
@@ -84,24 +87,42 @@ size_t sz, loff_t *off) {
 	/* читаем пользователя
 	 * и читаем только из его буфера
 	 */
+
 	kuid_t id = current_uid();
 	struct user_buf *u;
+
+	if (down_interruptible(&sem))
+		return -ERESTARTSYS;
 
 	list_for_each_entry(u, &uB.list, list) {
 		if (u->user_id.val == id.val) {
 			// нечего читать
-			if (u->r_index == u->w_index)
-				return 0;
+			while (u->r_index == u->w_index) {
+				up(&sem);
+				//pr_info("Read sleep\n");
+				if (wait_event_interruptible(rq,
+				u->r_index != u->w_index)) {
+				// если было прерывание
+					return -ERESTARTSYS;
+				}
+				if (down_interruptible(&sem))
+					return -ERESTARTSYS;
+			}
 
 			copy_to_user(bf, &u->buf[u->r_index], 1);
-			pr_info("My_pipe: read %c\n", u->buf[u->r_index]);
+			//pr_info("My_pipe: read %c\n", u->buf[u->r_index]);
 			u->r_index++;
 			if (u->r_index == buf_size)
 				u->r_index = 0;
+			//pr_info("w_index = %ld\n", u->w_index);
+			//pr_info("r_index = %ld\n", u->r_index);
+
 			goto r_rdy;
 		}
 	}
 r_rdy:
+	up(&sem);
+	wake_up_interruptible(&wq);
 	return 1;
 }
 
@@ -110,25 +131,40 @@ size_t sz, loff_t *off) {
 	/* читаем пользователя
 	 * и пишем именно в его буфер
 	 */
+
 	kuid_t id = current_uid();
 	struct user_buf *u;
+
+	if (down_interruptible(&sem))
+		return -ERESTARTSYS;
 
 	list_for_each_entry(u, &uB.list, list) {
 		if (u->user_id.val == id.val) {
 			//некуда писать
-			if (u->r_index - u->w_index == 1) {
-			} else {
-				copy_from_user(&u->buf[u->w_index], bf, 1);
-				pr_info("My_pipe: write %c\n",
-					u->buf[u->w_index]);
-				u->w_index++;
-				if (u->w_index == buf_size)
-					u->w_index = 0;
-				goto w_rdy;
+			while ((u->w_index + 1) % buf_size == u->r_index) {
+				up(&sem);
+				//pr_info("Write sleep\n");
+				wait_event_interruptible(wq,
+				(u->w_index + 1) % buf_size != u->r_index);
+				if (down_interruptible(&sem))
+					return -ERESTARTSYS;
+				//return 0;
 			}
+			copy_from_user(&u->buf[u->w_index], bf, 1);
+			//pr_info("My_pipe: write %c\n",
+				//u->buf[u->w_index]);
+			u->w_index++;
+			if (u->w_index == buf_size)
+				u->w_index = 0;
+			//pr_info("w_index = %ld\n", u->w_index);
+			//pr_info("r_index = %ld\n", u->r_index);
+
+			goto w_rdy;
 		}
 	}
 w_rdy:
+	up(&sem);
+	wake_up_interruptible(&rq);
 	return 1;
 }
 
@@ -173,6 +209,7 @@ static int __init char_device_init(void)
 	buf_size++; // для нормальной работы условий
 
 	INIT_LIST_HEAD(&uB.list);
+	sema_init(&sem, 1);
 
 	pr_info("My_pipe: init completed\n");
 
