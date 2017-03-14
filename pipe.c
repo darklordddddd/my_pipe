@@ -9,6 +9,7 @@
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/semaphore.h>
+#include <linux/string.h>
 #include <asm/uaccess.h>
 
 #define DEVICE_NAME "my_pipe"
@@ -28,11 +29,9 @@ struct user_buf {
 	unsigned long w_index;
 	unsigned long r_index;
 	struct list_head list;
+	int eof_flag;
 };
 static struct user_buf uB;
-
-//число пользователей
-static int count;
 
 static int buf_size = 1;
 module_param(buf_size, int, 0000);
@@ -85,6 +84,8 @@ static int pipe_open(struct inode *i, struct file *f)
 		 */
 		if (u->user_id.val == id.val) {
 			//pr_info("id = %d\n", id.val);
+			if  (f->f_mode & FMODE_WRITE)
+				u->eof_flag = 0;
 			if (id.val == SU_ID) {
 				pr_info("My_pipe: device has been opened for superuser\n");
 				f->f_op = &su_fops;
@@ -103,12 +104,14 @@ static int pipe_open(struct inode *i, struct file *f)
 	u->buf = kmalloc_array(buf_size, sizeof(char), GFP_KERNEL);
 	u->w_index = 0;
 	u->r_index = 0;
+	u->eof_flag = 0;
+
 	INIT_LIST_HEAD(&u->list);
 	list_add(&u->list, &uB.list);
-	count++;
 	//pr_info("id = %d\n", id.val);
 	if (id.val == SU_ID) {
 		pr_info("Superuser open\n");
+		// подмена структуры файл. операций
 		f->f_op = &su_fops;
 	} else
 		pr_info("My_pipe: device has been opened for this user\n");
@@ -122,38 +125,14 @@ static int pipe_release(struct inode *i, struct file *f)
 
 	// writer
 	if (f->f_mode & FMODE_WRITE) {
-		if (down_interruptible(&sem))
-		return -ERESTARTSYS;
-
 		list_for_each_entry(u, &uB.list, list) {
 			if (u->user_id.val == id.val) {
-				//некуда писать
-				while ((u->w_index + 1) % buf_size ==
-				u->r_index) {
-					up(&sem);
-					//pr_info("Write sleep\n");
-					wait_event_interruptible(wq,
-					(u->w_index + 1) % buf_size
-					!= u->r_index);
-					if (down_interruptible(&sem))
-						return -ERESTARTSYS;
-					//return 0;
-				}
-				u->buf[u->w_index] = 0;
-				//pr_info("My_pipe: write %c\n",
-					//u->buf[u->w_index]);
-				u->w_index++;
-				if (u->w_index == buf_size)
-					u->w_index = 0;
-				//pr_info("w_index = %ld\n", u->w_index);
-				//pr_info("r_index = %ld\n", u->r_index);
-
-				goto w_rdy;
+				u->eof_flag = 1;
+				goto all;
 			}
 		}
 	}
-w_rdy:
-	up(&sem);
+all:
 	wake_up_interruptible(&rq);
 	pr_info("My_pipe: device closed for this user\n");
 	return 0;
@@ -161,94 +140,171 @@ w_rdy:
 
 static ssize_t pipe_read(struct file *f, char __user *bf,
 size_t sz, loff_t *off) {
-	/* читаем пользователя
-	 * и читаем только из его буфера
-	 */
 
 	kuid_t id = current_uid();
 	struct user_buf *u;
+	size_t bytes_read = 0;
+	size_t delta;
+	size_t i;
+	unsigned long j;
 
+	/* выделяем временный буфер для чтения
+	 * данных с пользователя
+	 */
+	char *temp = kmalloc(sz, GFP_KERNEL);
+	if (temp == NULL) {
+		pr_info("kmalloc error\n");
+		return -1;
+	}
+
+	//pr_info("size = %d\n", sz);
+	
+	// семафор = 0 (заблокирован)
 	if (down_interruptible(&sem))
 		return -ERESTARTSYS;
 
+	// ищем нужного пользователя и его буфер
 	list_for_each_entry(u, &uB.list, list) {
 		if (u->user_id.val == id.val) {
-			// нечего читать
-			while (u->r_index == u->w_index) {
+			// если только все прочитано (для eof)
+			if ( (u->eof_flag) && (u->r_index == u->w_index) ) {
+				u->eof_flag = 0;
 				up(&sem);
-				//pr_info("Read sleep\n");
-				if (wait_event_interruptible(rq,
-				(u->r_index != u->w_index))) {
-				// если было прерывание
-					return -ERESTARTSYS;
+				kfree(temp);
+				return 0;	
+			}
+			while (sz != bytes_read) {
+				// нечего читать
+				while (u->r_index == u->w_index) {
+					up(&sem);
+					//pr_info("Read sleep\n");
+					if (wait_event_interruptible(rq,
+					(u->r_index != u->w_index) | (u->eof_flag))) {
+					// если было прерывание
+						return -ERESTARTSYS;
+					}
+					if (u->r_index == u->w_index) {
+						copy_to_user(bf, temp, bytes_read);	
+						kfree(temp);
+						return (ssize_t)bytes_read;
+					}
+					if (down_interruptible(&sem))
+						return -ERESTARTSYS;
 				}
-				if (down_interruptible(&sem))
-					return -ERESTARTSYS;
+				
+				//что больше: sz или доступное
+				//доступное место
+				delta = (size_t)((buf_size + u->w_index - u->r_index) % buf_size);
+				
+				//pr_info("read delta = %d\n", delta);
+				if (sz - bytes_read >= delta) {
+					// sz больше, читаем доступное
+					for (i = 0, j = u->r_index; i < delta; i++, j = (j + 1) % buf_size)
+						temp[bytes_read + i] = u->buf[j];
+					
+					bytes_read += delta;
+					u->r_index = u->w_index;
+				} else {
+					// sz меньше, читаем до конца
+					delta = sz - bytes_read;
+					for (i = 0, j = u->r_index; i < delta; i++, j = (j + 1) % buf_size)
+						temp[bytes_read + i] = u->buf[j];
+					
+					u->r_index = (u->r_index + (unsigned long)delta) % buf_size;
+					bytes_read = sz;
+				}
+				/*pr_info("bytes_read = %d\n", bytes_read);
+				pr_info("w_index = %ld\n", u->w_index);
+				pr_info("r_index = %ld\n", u->r_index);*/
+				
+				wake_up_interruptible(&wq);
 			}
-			if (u->buf[u->r_index] == 0) {
-				//pr_info("EOF\n");
-				u->r_index++;
-				if (u->r_index == buf_size)
-					u->r_index = 0;
-				return 0;
-			}
-			copy_to_user(bf, &u->buf[u->r_index], 1);
-			//pr_info("My_pipe: read %c\n", u->buf[u->r_index]);
-			u->r_index++;
-			if (u->r_index == buf_size)
-				u->r_index = 0;
-			//pr_info("w_index = %ld\n", u->w_index);
-			//pr_info("r_index = %ld\n", u->r_index);
-
 			goto r_rdy;
 		}
 	}
 r_rdy:
+	copy_to_user(bf, temp, bytes_read);	
+	kfree(temp);	
 	up(&sem);
 	wake_up_interruptible(&wq);
-	return 1;
+	return (ssize_t)bytes_read;
 }
 
 static ssize_t pipe_write(struct file *f, const char __user *bf,
 size_t sz, loff_t *off) {
-	/* читаем пользователя
-	 * и пишем именно в его буфер
-	 */
-
+	
 	kuid_t id = current_uid();
 	struct user_buf *u;
+	size_t bytes_written = 0;
+	size_t delta;
+	size_t i;
+	unsigned long j;
 
+	/* выделяем временный буфер для чтения
+	 * данных с пользователя
+	 */
+	char *temp = kmalloc(sz, GFP_KERNEL);
+	if (temp == NULL) {
+		pr_alert("kmalloc error\n");
+		return -1;
+	}
+	
+	// копируем данные с пользователя
+	copy_from_user(temp, bf, sz);
+
+	// семафор = 0 (заблокирован)
 	if (down_interruptible(&sem))
 		return -ERESTARTSYS;
 
+	// ищем нужного пользователя и его буфер
 	list_for_each_entry(u, &uB.list, list) {
 		if (u->user_id.val == id.val) {
-			//некуда писать
-			while ((u->w_index + 1) % buf_size == u->r_index) {
-				up(&sem);
-				//pr_info("Write sleep\n");
-				wait_event_interruptible(wq,
-				(u->w_index + 1) % buf_size != u->r_index);
-				if (down_interruptible(&sem))
-					return -ERESTARTSYS;
-				//return 0;
+			while (sz != bytes_written) {
+				//некуда писать, ждем
+				while ((u->w_index + 1) % buf_size == u->r_index) {
+					up(&sem);
+					//pr_info("Write sleep\n");
+					wait_event_interruptible(wq,
+					(u->w_index + 1) % buf_size != u->r_index);
+					if (down_interruptible(&sem))
+						return -ERESTARTSYS;
+				}
+				
+				//что больше: sz или доступное
+				delta = (size_t)((buf_size + u->r_index - u->w_index - 1) % buf_size);
+				//pr_info("write delta = %d\n", delta);
+				if (sz - bytes_written >= delta) {
+					// sz больше доступного, пишем в доступное
+					for (i = 0, j = u->w_index; i < delta; i++, j = (j + 1) % buf_size)
+						 u->buf[j] = temp[bytes_written + i];
+					
+					bytes_written += delta;
+					u->w_index = (u->w_index + (unsigned long)delta) % buf_size;
+				} else {
+					// sz меньше доступного, пишем, сколько есть
+					delta = sz - bytes_written;
+					for (i = 0, j = u->w_index; i < delta; i++, j = (j + 1) % buf_size)
+						 u->buf[j] = temp[bytes_written + i];
+					
+					u->w_index = (u->w_index + (unsigned long)delta) % buf_size;
+					bytes_written = sz;
+				}
+				/*pr_info("bytes_written = %d\n", bytes_written);
+				pr_info("w_index = %ld\n", u->w_index);
+				pr_info("r_index = %ld\n", u->r_index);*/
+				
+				// "пробуждаем" очередь чтения
+				wake_up_interruptible(&rq);
 			}
-			copy_from_user(&u->buf[u->w_index], bf, 1);
-			//pr_info("My_pipe: write %c\n",
-				//u->buf[u->w_index]);
-			u->w_index++;
-			if (u->w_index == buf_size)
-				u->w_index = 0;
-			//pr_info("w_index = %ld\n", u->w_index);
-			//pr_info("r_index = %ld\n", u->r_index);
-
 			goto w_rdy;
 		}
 	}
 w_rdy:
+	// освобождаем очередь, разблокируем семафор
+	kfree(temp);	
 	up(&sem);
 	wake_up_interruptible(&rq);
-	return 1;
+	return (ssize_t)bytes_written;
 }
 
 //su file operations
@@ -259,39 +315,14 @@ static int su_pipe_release(struct inode *i, struct file *f)
 
 	// writer
 	if (f->f_mode & FMODE_WRITE) {
-		if (down_interruptible(&sem))
-		return -ERESTARTSYS;
-
 		list_for_each_entry(u, &uB.list, list) {
 			if (u->user_id.val == SU_ID) {
-				//некуда писать
-				while ((u->w_index + 1) % buf_size ==
-				u->r_index) {
-					up(&sem);
-					//pr_info("Write sleep\n");
-					wait_event_interruptible(wq,
-					(u->w_index + 1) % buf_size !=
-					u->r_index);
-					if (down_interruptible(&sem))
-						return -ERESTARTSYS;
-					//return 0;
-				}
-				u->buf[u->w_index] = 0;
-				//pr_info("My_pipe: write %c\n",
-					//u->buf[u->w_index]);
-				u->w_index++;
-				if (u->w_index == buf_size)
-					u->w_index = 0;
-				//pr_info("w_index = %ld\n", u->w_index);
-				//pr_info("r_index = %ld\n", u->r_index);
-
-
-				goto w_rdy;
+				u->eof_flag = 1;
+				goto all;
 			}
 		}
 	}
-w_rdy:
-	up(&sem);
+all:
 	wake_up_interruptible(&rq);
 	pr_info("My_pipe: device closed for superuser\n");
 	return 0;
@@ -303,46 +334,91 @@ size_t sz, loff_t *off) {
 	 * и читаем только из его буфера
 	 */
 	struct user_buf *u;
+	size_t bytes_read = 0;
+	size_t delta;
+	size_t i;
+	unsigned long j;
 
+	/* выделяем временный буфер для чтения
+	 * данных с пользователя
+	 */
+	char *temp = kmalloc(sz, GFP_KERNEL);
+	if (temp == NULL) {
+		pr_info("kmalloc error\n");
+		return -1;
+	}
+
+	//pr_info("size = %d\n", sz);
+	
+	// семафор = 0 (заблокирован)
 	if (down_interruptible(&sem))
 		return -ERESTARTSYS;
 
+	// ищем нужного пользователя и его буфер
 	list_for_each_entry(u, &uB.list, list) {
 		if (u->user_id.val == SU_ID) {
-			// нечего читать
-			while (u->r_index == u->w_index) {
+			// если только все прочитано (для eof)
+			if ( (u->eof_flag) && (u->r_index == u->w_index) ) {
+				u->eof_flag = 0;
 				up(&sem);
-				//pr_info("Read sleep\n");
-				if (wait_event_interruptible(rq,
-				(u->r_index != u->w_index))) {
-				// если было прерывание
-					return -ERESTARTSYS;
+				kfree(temp);
+				return 0;	
+			}
+			while (sz != bytes_read) {
+				// нечего читать
+				while (u->r_index == u->w_index) {
+					up(&sem);
+					//pr_info("Read sleep\n");
+					if (wait_event_interruptible(rq,
+					(u->r_index != u->w_index) | (u->eof_flag))) {
+					// если было прерывание
+						return -ERESTARTSYS;
+					}
+					if (u->r_index == u->w_index) {
+						copy_to_user(bf, temp, bytes_read);	
+						kfree(temp);
+						return (ssize_t)bytes_read;
+					}
+					if (down_interruptible(&sem))
+						return -ERESTARTSYS;
 				}
-				if (down_interruptible(&sem))
-					return -ERESTARTSYS;
+				
+				//что больше: sz или доступное
+				//доступное место
+				delta = (size_t)((buf_size + u->w_index - u->r_index) % buf_size);
+				
+				//pr_info("read delta = %d\n", delta);
+				if (sz - bytes_read >= delta) {
+					// sz больше, читаем доступное
+					for (i = 0, j = u->r_index; i < delta; i++, j = (j + 1) % buf_size)
+						temp[bytes_read + i] = u->buf[j];
+					
+					bytes_read += delta;
+					u->r_index = u->w_index;
+				} else {
+					// sz меньше, читаем до конца
+					delta = sz - bytes_read;
+					for (i = 0, j = u->r_index; i < delta; i++, j = (j + 1) % buf_size)
+						temp[bytes_read + i] = u->buf[j];
+					
+					u->r_index = (u->r_index + (unsigned long)delta) % buf_size;
+					bytes_read = sz;
+				}
+				/*pr_info("bytes_read = %d\n", bytes_read);
+				pr_info("w_index = %ld\n", u->w_index);
+				pr_info("r_index = %ld\n", u->r_index);*/
+				
+				wake_up_interruptible(&wq);
 			}
-			if (u->buf[u->r_index] == 0) {
-				//pr_info("EOF\n");
-				u->r_index++;
-				if (u->r_index == buf_size)
-					u->r_index = 0;
-				return 0;
-			}
-			copy_to_user(bf, &u->buf[u->r_index], 1);
-			//pr_info("My_pipe: read %c\n", u->buf[u->r_index]);
-			u->r_index++;
-			if (u->r_index == buf_size)
-				u->r_index = 0;
-			//pr_info("w_index = %ld\n", u->w_index);
-			//pr_info("r_index = %ld\n", u->r_index);
-
 			goto r_rdy;
 		}
 	}
 r_rdy:
+	copy_to_user(bf, temp, bytes_read);	
+	kfree(temp);	
 	up(&sem);
 	wake_up_interruptible(&wq);
-	return 1;
+	return (ssize_t)bytes_read;
 }
 
 static ssize_t su_pipe_write(struct file *f, const char __user *bf,
@@ -351,38 +427,76 @@ size_t sz, loff_t *off) {
 	 * и пишем именно в его буфер
 	 */
 	struct user_buf *u;
+	size_t bytes_written = 0;
+	size_t delta;
+	size_t i;
+	unsigned long j;
 
+	/* выделяем временный буфер для чтения
+	 * данных с пользователя
+	 */
+	char *temp = kmalloc(sz, GFP_KERNEL);
+	if (temp == NULL) {
+		pr_alert("kmalloc error\n");
+		return -1;
+	}
+	
+	// копируем данные с пользователя
+	copy_from_user(temp, bf, sz);
+
+	// семафор = 0 (заблокирован)
 	if (down_interruptible(&sem))
 		return -ERESTARTSYS;
 
+	// ищем нужного пользователя и его буфер
 	list_for_each_entry(u, &uB.list, list) {
 		if (u->user_id.val == SU_ID) {
-			//некуда писать
-			while ((u->w_index + 1) % buf_size == u->r_index) {
-				up(&sem);
-				//pr_info("Write sleep\n");
-				wait_event_interruptible(wq,
-				(u->w_index + 1) % buf_size != u->r_index);
-				if (down_interruptible(&sem))
-					return -ERESTARTSYS;
-				//return 0;
+			while (sz != bytes_written) {
+				//некуда писать, ждем
+				while ((u->w_index + 1) % buf_size == u->r_index) {
+					up(&sem);
+					//pr_info("Write sleep\n");
+					wait_event_interruptible(wq,
+					(u->w_index + 1) % buf_size != u->r_index);
+					if (down_interruptible(&sem))
+						return -ERESTARTSYS;
+				}
+				
+				//что больше: sz или доступное
+				delta = (size_t)((buf_size + u->r_index - u->w_index - 1) % buf_size);
+				//pr_info("write delta = %d\n", delta);
+				if (sz - bytes_written >= delta) {
+					// sz больше доступного, пишем в доступное
+					for (i = 0, j = u->w_index; i < delta; i++, j = (j + 1) % buf_size)
+						 u->buf[j] = temp[bytes_written + i];
+					
+					bytes_written += delta;
+					u->w_index = (u->w_index + (unsigned long)delta) % buf_size;
+				} else {
+					// sz меньше доступного, пишем, сколько есть
+					delta = sz - bytes_written;
+					for (i = 0, j = u->w_index; i < delta; i++, j = (j + 1) % buf_size)
+						 u->buf[j] = temp[bytes_written + i];
+					
+					u->w_index = (u->w_index + (unsigned long)delta) % buf_size;
+					bytes_written = sz;
+				}
+				/*pr_info("bytes_written = %d\n", bytes_written);
+				pr_info("w_index = %ld\n", u->w_index);
+				pr_info("r_index = %ld\n", u->r_index);*/
+				
+				// "пробуждаем" очередь чтения
+				wake_up_interruptible(&rq);
 			}
-			copy_from_user(&u->buf[u->w_index], bf, 1);
-			//pr_info("My_pipe: write %c\n",
-				//u->buf[u->w_index]);
-			u->w_index++;
-			if (u->w_index == buf_size)
-				u->w_index = 0;
-			//pr_info("w_index = %ld\n", u->w_index);
-			//pr_info("r_index = %ld\n", u->r_index);
-
 			goto w_rdy;
 		}
 	}
 w_rdy:
+	// освобождаем очередь, разблокируем семафор
+	kfree(temp);	
 	up(&sem);
 	wake_up_interruptible(&rq);
-	return 1;
+	return (ssize_t)bytes_written;
 }
 
 static int __init char_device_init(void)

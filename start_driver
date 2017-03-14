@@ -1,0 +1,5 @@
+#!/bin/bash
+make
+insmod pipe.ko buf_size=32
+mknod /dev/pp c 245 0
+chmod 777 /dev/pp
