@@ -152,13 +152,12 @@ size_t sz, loff_t *off) {
 	 * данных с пользователя
 	 */
 	char *temp = kmalloc(sz, GFP_KERNEL);
-	if (temp == NULL) {
-		pr_info("kmalloc error\n");
+
+	if (temp == NULL)
 		return -1;
-	}
 
 	//pr_info("size = %d\n", sz);
-	
+
 	// семафор = 0 (заблокирован)
 	if (down_interruptible(&sem))
 		return -ERESTARTSYS;
@@ -166,12 +165,13 @@ size_t sz, loff_t *off) {
 	// ищем нужного пользователя и его буфер
 	list_for_each_entry(u, &uB.list, list) {
 		if (u->user_id.val == id.val) {
-			// если только все прочитано (для eof)
-			if ( (u->eof_flag) && (u->r_index == u->w_index) ) {
+			// если все прочитано (для eof)
+			if ((u->eof_flag) &&
+			 (u->r_index == u->w_index)) {
 				u->eof_flag = 0;
 				up(&sem);
 				kfree(temp);
-				return 0;	
+				return 0;
 			}
 			while (sz != bytes_read) {
 				// нечего читать
@@ -179,52 +179,56 @@ size_t sz, loff_t *off) {
 					up(&sem);
 					//pr_info("Read sleep\n");
 					if (wait_event_interruptible(rq,
-					(u->r_index != u->w_index) | (u->eof_flag))) {
-					// если было прерывание
+					(u->r_index != u->w_index)
+					| (u->eof_flag))) {
+// если было прерывание
 						return -ERESTARTSYS;
 					}
 					if (u->r_index == u->w_index) {
-						copy_to_user(bf, temp, bytes_read);	
+						copy_to_user
+						(bf, temp, bytes_read);
 						kfree(temp);
 						return (ssize_t)bytes_read;
 					}
 					if (down_interruptible(&sem))
 						return -ERESTARTSYS;
 				}
-				
-				//что больше: sz или доступное
+
+				//что больше:
+				//sz или доступное
 				//доступное место
-				delta = (size_t)((buf_size + u->w_index - u->r_index) % buf_size);
-				
-				//pr_info("read delta = %d\n", delta);
+				delta = (size_t)((buf_size
+				+ u->w_index - u->r_index) % buf_size);
+
 				if (sz - bytes_read >= delta) {
-					// sz больше, читаем доступное
-					for (i = 0, j = u->r_index; i < delta; i++, j = (j + 1) % buf_size)
-						temp[bytes_read + i] = u->buf[j];
-					
+// sz больше, читаем доступное
+					for (i = 0, j = u->r_index; i < delta;
+					i++, j = (j + 1) % buf_size)
+						temp[bytes_read + i] =
+						u->buf[j];
+
 					bytes_read += delta;
 					u->r_index = u->w_index;
 				} else {
-					// sz меньше, читаем до конца
+// sz меньше, читаем до конца
 					delta = sz - bytes_read;
-					for (i = 0, j = u->r_index; i < delta; i++, j = (j + 1) % buf_size)
-						temp[bytes_read + i] = u->buf[j];
-					
-					u->r_index = (u->r_index + (unsigned long)delta) % buf_size;
+					for (i = 0, j = u->r_index; i < delta;
+					i++, j = (j + 1) % buf_size)
+						temp[bytes_read + i] =
+						u->buf[j];
+
+					u->r_index = (u->r_index +
+					(unsigned long)delta) % buf_size;
 					bytes_read = sz;
 				}
-				/*pr_info("bytes_read = %d\n", bytes_read);
-				pr_info("w_index = %ld\n", u->w_index);
-				pr_info("r_index = %ld\n", u->r_index);*/
-				
 				wake_up_interruptible(&wq);
 			}
 			goto r_rdy;
 		}
 	}
 r_rdy:
-	copy_to_user(bf, temp, bytes_read);	
-	kfree(temp);	
+	copy_to_user(bf, temp, bytes_read);
+	kfree(temp);
 	up(&sem);
 	wake_up_interruptible(&wq);
 	return (ssize_t)bytes_read;
@@ -232,7 +236,7 @@ r_rdy:
 
 static ssize_t pipe_write(struct file *f, const char __user *bf,
 size_t sz, loff_t *off) {
-	
+
 	kuid_t id = current_uid();
 	struct user_buf *u;
 	size_t bytes_written = 0;
@@ -244,64 +248,67 @@ size_t sz, loff_t *off) {
 	 * данных с пользователя
 	 */
 	char *temp = kmalloc(sz, GFP_KERNEL);
-	if (temp == NULL) {
-		pr_alert("kmalloc error\n");
+
+	if (temp == NULL)
 		return -1;
-	}
-	
+
 	// копируем данные с пользователя
 	copy_from_user(temp, bf, sz);
 
-	// семафор = 0 (заблокирован)
+// семафор = 0 (заблокирован)
 	if (down_interruptible(&sem))
 		return -ERESTARTSYS;
 
-	// ищем нужного пользователя и его буфер
+// ищем нужного пользователя и его буфер
 	list_for_each_entry(u, &uB.list, list) {
 		if (u->user_id.val == id.val) {
 			while (sz != bytes_written) {
 				//некуда писать, ждем
-				while ((u->w_index + 1) % buf_size == u->r_index) {
+				while ((u->w_index + 1)
+				% buf_size == u->r_index) {
 					up(&sem);
 					//pr_info("Write sleep\n");
 					wait_event_interruptible(wq,
-					(u->w_index + 1) % buf_size != u->r_index);
+					(u->w_index + 1) % buf_size
+					!= u->r_index);
 					if (down_interruptible(&sem))
 						return -ERESTARTSYS;
 				}
-				
-				//что больше: sz или доступное
-				delta = (size_t)((buf_size + u->r_index - u->w_index - 1) % buf_size);
-				//pr_info("write delta = %d\n", delta);
+
+// что больше: sz или доступное
+				delta = (size_t)((buf_size + u->r_index
+				- u->w_index - 1) % buf_size);
 				if (sz - bytes_written >= delta) {
-					// sz больше доступного, пишем в доступное
-					for (i = 0, j = u->w_index; i < delta; i++, j = (j + 1) % buf_size)
-						 u->buf[j] = temp[bytes_written + i];
-					
+// sz больше доступного, пишем в доступное
+					for (i = 0, j = u->w_index; i < delta;
+					i++, j = (j + 1) % buf_size)
+						u->buf[j] =
+						temp[bytes_written + i];
+
 					bytes_written += delta;
-					u->w_index = (u->w_index + (unsigned long)delta) % buf_size;
+					u->w_index = (u->w_index
+					+ (unsigned long)delta) % buf_size;
 				} else {
-					// sz меньше доступного, пишем, сколько есть
+// sz меньше доступного, пишем, сколько есть
 					delta = sz - bytes_written;
-					for (i = 0, j = u->w_index; i < delta; i++, j = (j + 1) % buf_size)
-						 u->buf[j] = temp[bytes_written + i];
-					
-					u->w_index = (u->w_index + (unsigned long)delta) % buf_size;
+					for (i = 0, j = u->w_index;
+					i < delta; i++, j = (j + 1) % buf_size)
+						u->buf[j] =
+						temp[bytes_written + i];
+
+					u->w_index = (u->w_index
+					+ (unsigned long)delta) % buf_size;
 					bytes_written = sz;
 				}
-				/*pr_info("bytes_written = %d\n", bytes_written);
-				pr_info("w_index = %ld\n", u->w_index);
-				pr_info("r_index = %ld\n", u->r_index);*/
-				
-				// "пробуждаем" очередь чтения
+// "пробуждаем" очередь чтения
 				wake_up_interruptible(&rq);
 			}
 			goto w_rdy;
 		}
 	}
 w_rdy:
-	// освобождаем очередь, разблокируем семафор
-	kfree(temp);	
+// освобождаем
+	kfree(temp);
 	up(&sem);
 	wake_up_interruptible(&rq);
 	return (ssize_t)bytes_written;
@@ -343,26 +350,25 @@ size_t sz, loff_t *off) {
 	 * данных с пользователя
 	 */
 	char *temp = kmalloc(sz, GFP_KERNEL);
-	if (temp == NULL) {
-		pr_info("kmalloc error\n");
-		return -1;
-	}
 
-	//pr_info("size = %d\n", sz);
-	
-	// семафор = 0 (заблокирован)
+	if (temp == NULL)
+		return -1;
+
+
+// семафор = 0 (заблокирован)
 	if (down_interruptible(&sem))
 		return -ERESTARTSYS;
 
-	// ищем нужного пользователя и его буфер
+// ищем нужного пользователя и его буфер
 	list_for_each_entry(u, &uB.list, list) {
 		if (u->user_id.val == SU_ID) {
-			// если только все прочитано (для eof)
-			if ( (u->eof_flag) && (u->r_index == u->w_index) ) {
+// если только все прочитано (для eof)
+			if ((u->eof_flag) &&
+			(u->r_index == u->w_index)) {
 				u->eof_flag = 0;
 				up(&sem);
 				kfree(temp);
-				return 0;	
+				return 0;
 			}
 			while (sz != bytes_read) {
 				// нечего читать
@@ -370,52 +376,56 @@ size_t sz, loff_t *off) {
 					up(&sem);
 					//pr_info("Read sleep\n");
 					if (wait_event_interruptible(rq,
-					(u->r_index != u->w_index) | (u->eof_flag))) {
-					// если было прерывание
+					(u->r_index != u->w_index) |
+					(u->eof_flag))) {
+// если было прерывание
 						return -ERESTARTSYS;
 					}
 					if (u->r_index == u->w_index) {
-						copy_to_user(bf, temp, bytes_read);	
+						copy_to_user
+						(bf, temp, bytes_read);
 						kfree(temp);
 						return (ssize_t)bytes_read;
 					}
 					if (down_interruptible(&sem))
 						return -ERESTARTSYS;
 				}
-				
-				//что больше: sz или доступное
-				//доступное место
-				delta = (size_t)((buf_size + u->w_index - u->r_index) % buf_size);
-				
-				//pr_info("read delta = %d\n", delta);
+
+//что больше: sz или доступное
+//доступное место
+				delta = (size_t)((buf_size +
+				u->w_index - u->r_index) % buf_size);
+
 				if (sz - bytes_read >= delta) {
-					// sz больше, читаем доступное
-					for (i = 0, j = u->r_index; i < delta; i++, j = (j + 1) % buf_size)
-						temp[bytes_read + i] = u->buf[j];
-					
+// sz больше, читаем доступное
+					for (i = 0, j = u->r_index; i < delta;
+					i++, j = (j + 1) % buf_size)
+						temp[bytes_read + i] =
+						u->buf[j];
+
 					bytes_read += delta;
 					u->r_index = u->w_index;
 				} else {
-					// sz меньше, читаем до конца
+// sz меньше, читаем до конца
 					delta = sz - bytes_read;
-					for (i = 0, j = u->r_index; i < delta; i++, j = (j + 1) % buf_size)
-						temp[bytes_read + i] = u->buf[j];
-					
-					u->r_index = (u->r_index + (unsigned long)delta) % buf_size;
+					for (i = 0, j = u->r_index; i < delta;
+					i++, j = (j + 1) % buf_size)
+						temp[bytes_read + i] =
+						u->buf[j];
+
+					u->r_index = (u->r_index +
+					(unsigned long)delta) % buf_size;
 					bytes_read = sz;
 				}
-				/*pr_info("bytes_read = %d\n", bytes_read);
-				pr_info("w_index = %ld\n", u->w_index);
-				pr_info("r_index = %ld\n", u->r_index);*/
-				
+
 				wake_up_interruptible(&wq);
 			}
 			goto r_rdy;
 		}
 	}
 r_rdy:
-	copy_to_user(bf, temp, bytes_read);	
-	kfree(temp);	
+	copy_to_user(bf, temp, bytes_read);
+	kfree(temp);
 	up(&sem);
 	wake_up_interruptible(&wq);
 	return (ssize_t)bytes_read;
@@ -436,64 +446,68 @@ size_t sz, loff_t *off) {
 	 * данных с пользователя
 	 */
 	char *temp = kmalloc(sz, GFP_KERNEL);
-	if (temp == NULL) {
-		pr_alert("kmalloc error\n");
+
+	if (temp == NULL)
 		return -1;
-	}
-	
-	// копируем данные с пользователя
+
+// копируем данные с пользователя
 	copy_from_user(temp, bf, sz);
 
-	// семафор = 0 (заблокирован)
+// семафор = 0 (заблокирован)
 	if (down_interruptible(&sem))
 		return -ERESTARTSYS;
 
-	// ищем нужного пользователя и его буфер
+// ищем нужного пользователя и его буфер
 	list_for_each_entry(u, &uB.list, list) {
 		if (u->user_id.val == SU_ID) {
 			while (sz != bytes_written) {
 				//некуда писать, ждем
-				while ((u->w_index + 1) % buf_size == u->r_index) {
+				while ((u->w_index + 1) %
+					buf_size == u->r_index) {
 					up(&sem);
 					//pr_info("Write sleep\n");
 					wait_event_interruptible(wq,
-					(u->w_index + 1) % buf_size != u->r_index);
+					(u->w_index + 1) % buf_size
+					!= u->r_index);
 					if (down_interruptible(&sem))
 						return -ERESTARTSYS;
 				}
-				
-				//что больше: sz или доступное
-				delta = (size_t)((buf_size + u->r_index - u->w_index - 1) % buf_size);
-				//pr_info("write delta = %d\n", delta);
+
+//что больше: sz или доступное
+				delta = (size_t)((buf_size +
+				u->r_index - u->w_index - 1) % buf_size);
 				if (sz - bytes_written >= delta) {
-					// sz больше доступного, пишем в доступное
-					for (i = 0, j = u->w_index; i < delta; i++, j = (j + 1) % buf_size)
-						 u->buf[j] = temp[bytes_written + i];
-					
+// sz больше доступного, пишем в доступное
+					for (i = 0, j = u->w_index; i < delta;
+					i++, j = (j + 1) % buf_size)
+						u->buf[j] =
+						temp[bytes_written + i];
+
 					bytes_written += delta;
-					u->w_index = (u->w_index + (unsigned long)delta) % buf_size;
+					u->w_index = (u->w_index +
+					(unsigned long)delta) % buf_size;
 				} else {
-					// sz меньше доступного, пишем, сколько есть
+// sz меньше доступного, пишем, сколько есть
 					delta = sz - bytes_written;
-					for (i = 0, j = u->w_index; i < delta; i++, j = (j + 1) % buf_size)
-						 u->buf[j] = temp[bytes_written + i];
-					
-					u->w_index = (u->w_index + (unsigned long)delta) % buf_size;
+					for (i = 0, j = u->w_index; i < delta;
+					i++, j = (j + 1) % buf_size)
+						u->buf[j] =
+						temp[bytes_written + i];
+
+					u->w_index = (u->w_index +
+					(unsigned long)delta) % buf_size;
 					bytes_written = sz;
 				}
-				/*pr_info("bytes_written = %d\n", bytes_written);
-				pr_info("w_index = %ld\n", u->w_index);
-				pr_info("r_index = %ld\n", u->r_index);*/
-				
-				// "пробуждаем" очередь чтения
+
+// "пробуждаем" очередь чтения
 				wake_up_interruptible(&rq);
 			}
 			goto w_rdy;
 		}
 	}
 w_rdy:
-	// освобождаем очередь, разблокируем семафор
-	kfree(temp);	
+// освобождаем
+	kfree(temp);
 	up(&sem);
 	wake_up_interruptible(&rq);
 	return (ssize_t)bytes_written;
@@ -559,3 +573,4 @@ module_exit(char_device_exit);
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Character device module/My pipe");
 MODULE_AUTHOR("Sergey Samokhvalov/Ilya Vedmanov");
+\ No newline at end of file
