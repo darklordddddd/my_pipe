@@ -573,4 +573,4 @@ module_exit(char_device_exit);
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Character device module/My pipe");
 MODULE_AUTHOR("Sergey Samokhvalov/Ilya Vedmanov");
-\ No newline at end of file
+
